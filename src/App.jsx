@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as XLSX from "xlsx";
+import jsQR from "jsqr";
+import QRCode from "qrcode";
 
 // ── Google Fonts ────────────────────────────────────────────────────────
 const _fl = document.createElement("link"); _fl.rel="stylesheet";
@@ -174,21 +176,24 @@ function ChurchLogo({size=48}){
     <rect x="46" y="14" width="8" height="2" rx="1" fill={C.gold}/>
   </svg>;
 }
+// QR prefix so the scanner can tell a Finot Tiguhan member badge apart from
+// any other QR code someone might point the camera at.
+const QR_PREFIX = "FT-MEMBER:";
+
+// Renders a REAL, camera-scannable QR code (previous version was a fake
+// hash-based pattern that could never actually be decoded by anything).
 function QRCodeSVG({value,size=130}){
-  const hash=[...value].reduce((a,c)=>(a*31+c.charCodeAt(0))>>>0,0);
-  const cells=21,cell=size/cells,bits=[];
-  for(let r=0;r<cells;r++) for(let c=0;c<cells;c++){
-    const isTL=r<7&&c<7,isTR=r<7&&c>=cells-7,isBL=r>=cells-7&&c<7;
-    let dark=false;
-    if(isTL||isTR||isBL){const fr=isTL?r:isTR?r:r-(cells-7),fc=isTL?c:isTR?c-(cells-7):c;dark=(fr===0||fr===6||fc===0||fc===6)||(fr>=2&&fr<=4&&fc>=2&&fc<=4);}
-    else if((r===6&&c>7&&c<cells-8)||(c===6&&r>7&&r<cells-8))dark=(r+c)%2===0;
-    else dark=(((hash^((r*37+c*13)*0x9e3779b9))>>>0)%3)!==0;
-    bits.push({r,c,dark});
-  }
-  return <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{display:"block"}}>
-    <rect width={size} height={size} fill="white"/>
-    {bits.map(({r,c,dark})=>dark?<rect key={`${r}-${c}`} x={c*cell} y={r*cell} width={cell} height={cell} fill={C.bg}/>:null)}
-  </svg>;
+  const canvasRef=useRef(null);
+  useEffect(()=>{
+    const canvas=canvasRef.current;
+    if(!canvas)return;
+    QRCode.toCanvas(canvas, QR_PREFIX+value, {
+      width:size, margin:1,
+      color:{ dark:C.bg, light:"#ffffff" },
+      errorCorrectionLevel:"M",
+    }, err=>{ if(err) console.error("QR generation failed:", err); });
+  },[value,size]);
+  return <canvas ref={canvasRef} width={size} height={size} style={{display:"block",width:size,height:size}}/>;
 }
 
 // ── Excel export ────────────────────────────────────────────────────────
@@ -338,58 +343,175 @@ export default function App(){
 // SCANNER TAB
 // ══════════════════════════════════════════════════════════════════════════
 function ScannerTab({members,attendance,markAttendance,showToast,configured}){
+  const [mode,setMode]=useState("camera"); // "camera" | "manual"
   const [query,setQuery]=useState("");
   const [lastScanned,setLastScanned]=useState(null);
+  const [camStatus,setCamStatus]=useState("starting"); // starting|active|denied|unsupported|error
+  const [paused,setPaused]=useState(false);
   const inputRef=useRef();
-  useEffect(()=>{inputRef.current?.focus();},[]);
+  const videoRef=useRef(null);
+  const canvasRef=useRef(null);
+  const streamRef=useRef(null);
+  const rafRef=useRef(null);
+  const pausedRef=useRef(false);
+  const useBarcodeDetectorRef=useRef(false);
+  const detectorRef=useRef(null);
+
   const todayCount=attendance.filter(r=>r.date===today()&&r.event_id===EVENT_ID).length;
-  const doCheckin=async(member)=>{
+
+  const doCheckin=useCallback(async(member)=>{
     const ok=await markAttendance(member.id);
-    if(ok){setLastScanned(member);showToast("🙏 "+member.name+" checked in","success");}
+    if(ok){
+      setLastScanned(member);
+      showToast("🙏 "+member.name+" checked in","success");
+      // Pause scanning briefly so the same badge isn't re-scanned instantly.
+      pausedRef.current=true;setPaused(true);
+      setTimeout(()=>{pausedRef.current=false;setPaused(false);},2500);
+    } else {
+      // markAttendance already toasts "already checked in" — still pause a beat.
+      pausedRef.current=true;setPaused(true);
+      setTimeout(()=>{pausedRef.current=false;setPaused(false);},1500);
+    }
     setQuery("");
-  };
+  },[markAttendance,showToast]);
+
+  const handleDecoded=useCallback((text)=>{
+    if(!text)return;
+    let memberId=null;
+    if(text.startsWith(QR_PREFIX)) memberId=text.slice(QR_PREFIX.length);
+    else memberId=text.trim(); // tolerate old/plain-ID badges too
+    const member=members.find(m=>m.id===memberId);
+    if(member) doCheckin(member);
+    else showToast("QR code not recognized — not a member badge","error");
+  },[members,doCheckin,showToast]);
+
+  // ── Camera lifecycle ────────────────────────────────────────────────
+  useEffect(()=>{
+    if(mode!=="camera")return;
+    let cancelled=false;
+
+    if(!navigator.mediaDevices?.getUserMedia){
+      setCamStatus("unsupported");
+      return;
+    }
+    // BarcodeDetector = fast native path (Chrome/Edge/Android). Falls back to jsQR otherwise (needed for iOS Safari).
+    if("BarcodeDetector" in window){
+      try{ detectorRef.current=new window.BarcodeDetector({formats:["qr_code"]}); useBarcodeDetectorRef.current=true; }
+      catch{ useBarcodeDetectorRef.current=false; }
+    }
+
+    (async()=>{
+      try{
+        const stream=await navigator.mediaDevices.getUserMedia({
+          video:{ facingMode:{ideal:"environment"}, width:{ideal:640}, height:{ideal:480} },
+          audio:false
+        });
+        if(cancelled){ stream.getTracks().forEach(t=>t.stop()); return; }
+        streamRef.current=stream;
+        const v=videoRef.current;
+        if(!v)return;
+        v.srcObject=stream;
+        v.setAttribute("playsinline","true"); // required for iOS Safari — without this it forces fullscreen and blocks the loop
+        await v.play();
+        setCamStatus("active");
+        scanLoop();
+      }catch(e){
+        if(cancelled)return;
+        setCamStatus(e?.name==="NotAllowedError"?"denied":"error");
+      }
+    })();
+
+    function scanLoop(){
+      rafRef.current=requestAnimationFrame(scanLoop);
+      const v=videoRef.current,c=canvasRef.current;
+      if(!v||!c||v.readyState!==v.HAVE_ENOUGH_DATA)return;
+      if(pausedRef.current)return;
+
+      const w=320,h=Math.round(w*(v.videoHeight/v.videoWidth||0.75));
+      if(c.width!==w)c.width=w;
+      if(c.height!==h)c.height=h;
+      const ctx=c.getContext("2d",{willReadFrequently:true});
+      ctx.drawImage(v,0,0,w,h);
+
+      if(useBarcodeDetectorRef.current&&detectorRef.current){
+        detectorRef.current.detect(c).then(codes=>{
+          if(codes?.[0]?.rawValue)handleDecoded(codes[0].rawValue);
+        }).catch(()=>{});
+      } else {
+        const imgData=ctx.getImageData(0,0,w,h);
+        const result=jsQR(imgData.data,w,h,{inversionAttempts:"dontInvert"});
+        if(result?.data)handleDecoded(result.data);
+      }
+    }
+
+    return()=>{
+      cancelled=true;
+      if(rafRef.current)cancelAnimationFrame(rafRef.current);
+      streamRef.current?.getTracks().forEach(t=>t.stop());
+      streamRef.current=null;
+    };
+  },[mode,handleDecoded]);
+
+  useEffect(()=>{ if(mode==="manual") inputRef.current?.focus(); },[mode]);
+
   const filtered=query.length>1?members.filter(m=>m.name.toLowerCase().includes(query.toLowerCase())||m.id.toLowerCase().includes(query.toLowerCase())):[];
+
   return <div>
-    <div style={{marginBottom:18}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,flexWrap:"wrap",gap:10}}>
       <div style={{display:"inline-flex",alignItems:"center",gap:10,background:C.goldDim,border:`1.5px solid ${C.gold}66`,borderRadius:12,padding:"10px 20px"}}>
         <div style={{width:8,height:8,borderRadius:"50%",background:C.gold,boxShadow:`0 0 6px ${C.gold}`}}/>
         <span style={{fontFamily:"'Noto Serif Ethiopic',serif",fontSize:17,color:C.gold,fontWeight:700}}>{"መዝሙር ጥናት"}</span>
       </div>
+      <button onClick={()=>setMode(m=>m==="camera"?"manual":"camera")} className="btn-outline" style={{padding:"8px 14px",fontSize:12}}>
+        {mode==="camera"?"⌨️ Manual check-in":"📷 Camera scan"}
+      </button>
     </div>
-    <div style={{background:`linear-gradient(160deg,${C.teal},${C.tealMid})`,border:`1px solid ${C.gold}44`,borderRadius:18,padding:24,marginBottom:20,textAlign:"center",position:"relative",overflow:"hidden"}}>
-      <div style={{position:"absolute",top:-50,right:-50,width:180,height:180,borderRadius:"50%",background:C.gold,opacity:.04,pointerEvents:"none"}}/>
-      <div style={{position:"relative",width:190,height:190,margin:"0 auto 18px",borderRadius:14,overflow:"hidden",border:`2px solid ${C.gold}55`}}>
-        <div style={{width:"100%",height:"100%",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:8}}>
-          <ChurchLogo size={58}/><div style={{fontSize:11,color:C.textDim}}>Search below to check in</div>
+
+    {mode==="camera"?<>
+      <div style={{background:`linear-gradient(160deg,${C.teal},${C.tealMid})`,border:`1px solid ${C.gold}44`,borderRadius:18,padding:24,marginBottom:20,textAlign:"center",position:"relative",overflow:"hidden"}}>
+        <div style={{position:"relative",width:240,height:240,margin:"0 auto 18px",borderRadius:14,overflow:"hidden",border:`2px solid ${C.gold}55`,background:C.bg}}>
+          <video ref={videoRef} muted playsInline autoPlay style={{width:"100%",height:"100%",objectFit:"cover",display:camStatus==="active"?"block":"none"}}/>
+          <canvas ref={canvasRef} style={{display:"none"}}/>
+          {camStatus!=="active"&&<div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:10,padding:16,textAlign:"center"}}>
+            {camStatus==="starting"&&<><Spinner size={26}/><div style={{fontSize:11,color:C.textDim}}>Starting camera…</div></>}
+            {camStatus==="denied"&&<><div style={{fontSize:26}}>🚫</div><div style={{fontSize:11,color:C.danger,lineHeight:1.5}}>Camera access denied.<br/>Allow camera permission for this site in your browser settings, then reload.</div></>}
+            {camStatus==="unsupported"&&<><div style={{fontSize:26}}>⚠️</div><div style={{fontSize:11,color:C.warn,lineHeight:1.5}}>Camera scanning isn't supported in this browser. Use manual check-in instead.</div></>}
+            {camStatus==="error"&&<><div style={{fontSize:26}}>⚠️</div><div style={{fontSize:11,color:C.danger,lineHeight:1.5}}>Couldn't access the camera. Make sure no other app is using it, then reload.</div></>}
+          </div>}
+          {camStatus==="active"&&<>
+            <div style={{position:"absolute",left:0,right:0,height:2,background:`linear-gradient(90deg,transparent,${C.gold},transparent)`,animation:"scanLine 2.2s ease-in-out infinite",opacity:paused?0:.8}}/>
+            {[[0,"top:8px;left:8px","2px 0 0 2px"],[1,"top:8px;right:8px","2px 2px 0 0"],[2,"bottom:8px;left:8px","0 0 2px 2px"],[3,"bottom:8px;right:8px","0 2px 2px 0"]].map(([i,pos,bw])=>(
+              <div key={i} style={{position:"absolute",width:18,height:18,borderColor:C.gold,borderStyle:"solid",borderWidth:bw,...Object.fromEntries(pos.split(";").map(s=>s.split(":")))}}/>
+            ))}
+          </>}
         </div>
-        <div style={{position:"absolute",left:0,right:0,height:2,background:`linear-gradient(90deg,transparent,${C.gold},transparent)`,animation:"scanLine 2.2s ease-in-out infinite",opacity:.8}}/>
-        {[[0,"top:8px;left:8px","2px 0 0 2px"],[1,"top:8px;right:8px","2px 2px 0 0"],[2,"bottom:8px;left:8px","0 0 2px 2px"],[3,"bottom:8px;right:8px","0 2px 2px 0"]].map(([i,pos,bw])=>(
-          <div key={i} style={{position:"absolute",width:18,height:18,borderColor:C.gold,borderStyle:"solid",borderWidth:bw,...Object.fromEntries(pos.split(";").map(s=>s.split(":")))}}/>
-        ))}
+        <div style={{fontSize:44,fontFamily:"'Noto Serif Ethiopic',serif",color:C.gold,fontWeight:700,lineHeight:1}}>{todayCount}</div>
+        <div style={{fontSize:12,color:C.textMuted,marginTop:4}}>checked in today</div>
+        {camStatus==="active"&&<div style={{fontSize:11,color:C.textDim,marginTop:8}}>{paused?"✓ Scanned — hold for next person…":"Point the camera at a member's QR badge"}</div>}
       </div>
-      <div style={{fontSize:44,fontFamily:"'Noto Serif Ethiopic',serif",color:C.gold,fontWeight:700,lineHeight:1}}>{todayCount}</div>
-      <div style={{fontSize:12,color:C.textMuted,marginTop:4}}>checked in today</div>
-    </div>
-    <div style={{position:"relative",marginBottom:8}}>
-      <div style={{position:"absolute",left:13,top:"50%",transform:"translateY(-50%)",color:C.textDim,fontSize:15,pointerEvents:"none"}}>🔍</div>
-      <input ref={inputRef} value={query} onChange={e=>setQuery(e.target.value)}
-        onKeyDown={e=>{if(e.key==="Enter"&&filtered.length===1)doCheckin(filtered[0]);}}
-        placeholder="Search member name or ID…"
-        style={{width:"100%",padding:"13px 16px 13px 42px",borderRadius:10,border:`1px solid ${C.tealBorder}`,background:C.teal,color:C.text,fontSize:14,transition:"border-color .2s"}}
-        onFocus={e=>e.target.style.borderColor=C.gold} onBlur={e=>e.target.style.borderColor=C.tealBorder}/>
-    </div>
-    {filtered.length>0&&<Card style={{marginBottom:16}}>
-      {filtered.map(m=>{
-        const checked=attendance.some(r=>r.member_id===m.id&&r.date===today()&&r.event_id===EVENT_ID);
-        return <div key={m.id} className={checked?"":"row-hover"} onClick={()=>!checked&&doCheckin(m)}
-          style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderBottom:`1px solid ${C.tealBorder}22`,opacity:checked?.65:1,transition:"background .15s"}}>
-          <Avatar name={m.name} size={38}/>
-          <div style={{flex:1}}><div style={{fontSize:14,fontWeight:500}}>{m.name}</div><div style={{fontSize:12,color:C.textDim}}>{m.group} · {m.id}</div></div>
-          {checked?<span style={{fontSize:12,color:C.success,background:C.successBg,padding:"4px 12px",borderRadius:20}}>✓ In</span>
-            :<span style={{fontSize:12,color:C.gold,background:C.goldFaint,border:`1px solid ${C.gold}44`,padding:"4px 12px",borderRadius:20}}>Check in</span>}
-        </div>;
-      })}
-    </Card>}
+    </>:<>
+      <div style={{position:"relative",marginBottom:8}}>
+        <div style={{position:"absolute",left:13,top:"50%",transform:"translateY(-50%)",color:C.textDim,fontSize:15,pointerEvents:"none"}}>🔍</div>
+        <input ref={inputRef} value={query} onChange={e=>setQuery(e.target.value)}
+          onKeyDown={e=>{if(e.key==="Enter"&&filtered.length===1)doCheckin(filtered[0]);}}
+          placeholder="Search member name or ID…"
+          style={{width:"100%",padding:"13px 16px 13px 42px",borderRadius:10,border:`1px solid ${C.tealBorder}`,background:C.teal,color:C.text,fontSize:14,transition:"border-color .2s"}}
+          onFocus={e=>e.target.style.borderColor=C.gold} onBlur={e=>e.target.style.borderColor=C.tealBorder}/>
+      </div>
+      {filtered.length>0&&<Card style={{marginBottom:16}}>
+        {filtered.map(m=>{
+          const checked=attendance.some(r=>r.member_id===m.id&&r.date===today()&&r.event_id===EVENT_ID);
+          return <div key={m.id} className={checked?"":"row-hover"} onClick={()=>!checked&&doCheckin(m)}
+            style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderBottom:`1px solid ${C.tealBorder}22`,opacity:checked?.65:1,transition:"background .15s"}}>
+            <Avatar name={m.name} size={38}/>
+            <div style={{flex:1}}><div style={{fontSize:14,fontWeight:500}}>{m.name}</div><div style={{fontSize:12,color:C.textDim}}>{m.group} · {m.id}</div></div>
+            {checked?<span style={{fontSize:12,color:C.success,background:C.successBg,padding:"4px 12px",borderRadius:20}}>✓ In</span>
+              :<span style={{fontSize:12,color:C.gold,background:C.goldFaint,border:`1px solid ${C.gold}44`,padding:"4px 12px",borderRadius:20}}>Check in</span>}
+          </div>;
+        })}
+      </Card>}
+    </>}
+
     {lastScanned&&<div style={{background:C.successBg,border:`1px solid ${C.success}44`,borderRadius:12,padding:"16px 20px",display:"flex",alignItems:"center",gap:14}}>
       <div style={{fontSize:28}}>🙏</div>
       <div><div style={{fontSize:15,fontWeight:600,color:C.success}}>Welcome, {lastScanned.name.split(" ")[0]}!</div>
@@ -569,14 +691,19 @@ function SpotifySongView({song,onBack,isAdmin,onEdit,onRequestDelete}){
     if(!hasAudio)return;
     const a=document.createElement("audio");
     audioRef.current=a;
-    a.crossOrigin="anonymous";
+    a.preload="auto";
+    // NOTE: no crossOrigin="anonymous" here on purpose. It's only needed if you
+    // pipe the audio through Web Audio API / canvas; for plain playback it forces
+    // a strict CORS handshake on every Range request the browser makes while
+    // seeking, and if Supabase's storage CORS config doesn't cover that exactly,
+    // playback fails silently — which is what was happening.
     a.addEventListener("timeupdate",()=>setCurrent(a.currentTime));
     a.addEventListener("loadedmetadata",()=>{setDuration(a.duration||0);setReady(true);setLoadingAudio(false);});
     a.addEventListener("canplaythrough",()=>{setReady(true);setLoadingAudio(false);});
     a.addEventListener("ended",()=>setPlaying(false));
     a.addEventListener("waiting",()=>setLoadingAudio(true));
     a.addEventListener("playing",()=>setLoadingAudio(false));
-    a.addEventListener("error",()=>{setLoadingAudio(false);setPlaying(false);setReady(false);setAudioError("Playback failed — check audio URL or re-upload.");});
+    a.addEventListener("error",()=>{setLoadingAudio(false);setPlaying(false);setReady(false);setAudioError("Playback failed — make sure the '"+AUDIO_BUCKET+"' storage bucket in Supabase is set to Public.");});
     a.src=song.audio_url;
     a.load();
     return()=>{a.pause();a.src="";audioRef.current=null;};

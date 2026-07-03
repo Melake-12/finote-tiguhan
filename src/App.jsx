@@ -43,12 +43,20 @@ const sb = {
     if (!r.ok) throw new Error(await r.text());
   },
   async uploadAudio(file, fileName) {
-    const path = `${Date.now()}_${fileName}`;
+    const ext = fileName.split('.').pop().toLowerCase();
+    const mimeMap = { mp3:"audio/mpeg", ogg:"audio/ogg", wav:"audio/wav", m4a:"audio/mp4", aac:"audio/aac", flac:"audio/flac" };
+    const contentType = mimeMap[ext] || file.type || "audio/mpeg";
+    const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const path = `${Date.now()}_${safeName}`;
     const r = await fetch(`${SUPABASE_URL}/storage/v1/object/${AUDIO_BUCKET}/${path}`, {
-      method:"POST", headers:{ "apikey": SUPABASE_ANON, "Authorization":`Bearer ${SUPABASE_ANON}`, "Content-Type": file.type },
+      method:"POST",
+      headers:{ "apikey": SUPABASE_ANON, "Authorization":`Bearer ${SUPABASE_ANON}`, "Content-Type": contentType, "x-upsert": "true" },
       body: file
     });
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) {
+      const errText = await r.text();
+      throw new Error(`Storage error ${r.status}: ${errText}`);
+    }
     return `${SUPABASE_URL}/storage/v1/object/public/${AUDIO_BUCKET}/${path}`;
   },
   async deleteAudio(url) {
@@ -742,7 +750,11 @@ function MuziqTab({songs,setSongs,songCats,setSongCats,showToast,configured}){
         audio_url=await sb.uploadAudio(audioFile,audioFile.name);
         audio_name=audioFile.name;
         showToast("Audio uploaded ✓","success");
-      }catch(e){showToast("Audio upload failed: "+e.message,"error");setSaving(false);setUploading(false);return;}
+      }catch(e){
+        showToast("Audio upload failed: "+e.message,"error");
+        console.error("Upload error:",e);
+        setSaving(false);setUploading(false);return;
+      }
       setUploading(false);
     }
     const songData={title:form.title.trim(),category:form.category,lyrics:form.lyrics,audio_url,audio_name,added_by:"Admin",added_at:today()};
